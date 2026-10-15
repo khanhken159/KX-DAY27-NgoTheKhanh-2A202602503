@@ -63,17 +63,19 @@ def node_route(state: ReviewState) -> dict:
 def node_human_approval(state: ReviewState) -> dict:
     """Pause and ask the human."""
     a = state["analysis"]
-    # TODO: call interrupt(payload) where payload contains these fields:
-    #         "kind": "approval_request",
-    #         "confidence": a.confidence,
-    #         "confidence_reasoning": a.confidence_reasoning,
-    #         "summary": a.summary,
-    #         "comments": [c.model_dump() for c in a.comments],
-    #         "diff_preview": state["pr_diff"][:2000],
-    # interrupt() returns whatever the caller passes via Command(resume=...).
-    # response = interrupt(...)
-    # return {"human_choice": response["choice"], "human_feedback": response.get("feedback")}
-    raise NotImplementedError("Call interrupt() with an approval_request payload")
+    response = interrupt({
+        "kind": "approval_request",
+        "pr_url": state["pr_url"],
+        "confidence": a.confidence,
+        "confidence_reasoning": a.confidence_reasoning,
+        "summary": a.summary,
+        "comments": [comment.model_dump() for comment in a.comments],
+        "diff_preview": state["pr_diff"][:2000],
+    })
+    return {
+        "human_choice": response.get("choice"),
+        "human_feedback": response.get("feedback"),
+    }
 
 
 def _render_comment_body(state: ReviewState) -> str:
@@ -87,28 +89,65 @@ def _render_comment_body(state: ReviewState) -> str:
     return "\n".join(lines)
 
 
-def _post(state: ReviewState, label: str) -> str:
-    """Post the review comment to the PR. Returns the final_action string."""
+def _post(state: ReviewState, label: str) -> tuple[str, str | None]:
+    """Post the review comment and return its action label and GitHub URL."""
     try:
-        post_review_comment(state["pr_url"], _render_comment_body(state))
+        comment_url = post_review_comment(state["pr_url"], _render_comment_body(state))
         console.print(f"  [green]✓[/green] posted comment to {state['pr_url']}")
-        return label
+        return label, comment_url
     except Exception as e:
         console.print(f"  [red]✗[/red] post failed: {e}")
-        return "commit_failed"
+        return "commit_failed", None
+
+
+def _rewrite_review(state: ReviewState) -> PRAnalysis:
+    """Revise the proposed review using explicit reviewer edit instructions."""
+    llm = get_llm().with_structured_output(PRAnalysis)
+    with console.status("[dim]Applying reviewer edits...[/dim]"):
+        return llm.invoke([
+            {
+                "role": "system",
+                "content": (
+                    "Revise this code review according to the reviewer's edit instructions. "
+                    "Do not modify source code or invent findings. Return a complete review "
+                    "with an updated summary, comments, confidence, and reasoning."
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"Title: {state['pr_title']}\nDiff:\n{state['pr_diff']}\n\n"
+                    f"Current review:\n{state['analysis'].model_dump_json(indent=2)}\n\n"
+                    f"Reviewer edit instructions:\n{state.get('human_feedback', '')}"
+                ),
+            },
+        ])
 
 
 def node_commit(state: ReviewState) -> dict:
     console.print("[cyan]→ commit[/cyan]")
     if state.get("human_choice") == "approve":
-        return {"final_action": _post(state, "committed")}
+        action, comment_url = _post(state, "committed")
+        return {"final_action": action, "posted_comment_url": comment_url}
+    if state.get("human_choice") == "edit":
+        if not (state.get("human_feedback") or "").strip():
+            return {"final_action": "edit_requires_feedback"}
+        revised = _rewrite_review(state)
+        edited_state = {**state, "analysis": revised}
+        action, comment_url = _post(edited_state, "committed")
+        return {
+            "analysis": revised,
+            "final_action": action,
+            "posted_comment_url": comment_url,
+        }
     console.print(f"  [yellow]·[/yellow] skipping comment (choice={state.get('human_choice')})")
     return {"final_action": "rejected"}
 
 
 def node_auto_approve(state):
     console.print("[cyan]→ auto_approve[/cyan]  [dim]high confidence — posting directly[/dim]")
-    return {"final_action": _post(state, "auto_approved")}
+    action, comment_url = _post(state, "auto_approved")
+    return {"final_action": action, "posted_comment_url": comment_url}
 
 
 def node_escalate(state):     return {"final_action": "pending_escalation"}
@@ -133,8 +172,7 @@ def build_graph():
     g.add_edge("human_approval", "commit")
     g.add_edge("commit", END)
     g.add_edge("escalate", END)
-    # TODO: compile with checkpointer=MemorySaver()
-    return g.compile()
+    return g.compile(checkpointer=MemorySaver())
 
 
 def prompt_human(payload: dict) -> dict:
@@ -151,10 +189,14 @@ def prompt_human(payload: dict) -> dict:
         console.print("\n[dim]--- diff preview ---[/dim]")
         console.print(payload["diff_preview"])
 
-    choice = ""
-    while choice not in {"approve", "reject", "edit"}:
-        choice = console.input("\n[bold]Choice (approve/reject/edit)?[/bold] ").strip().lower()
-    feedback = console.input("Feedback: ").strip() if choice != "approve" else ""
+    while True:
+        choice = ""
+        while choice not in {"approve", "reject", "edit"}:
+            choice = console.input("\n[bold]Choice (approve/reject/edit)?[/bold] ").strip().lower()
+        feedback = console.input("Feedback: ").strip() if choice != "approve" else ""
+        if choice != "edit" or feedback:
+            break
+        console.print("[yellow]Please provide edit instructions.[/yellow]")
     return {"choice": choice, "feedback": feedback}
 
 
@@ -174,12 +216,10 @@ def main() -> None:
 
     result = app.invoke({"pr_url": args.pr, "thread_id": thread_id}, cfg)
 
-    # TODO: write a `while "__interrupt__" in result:` loop:
-    #   - take payload from result["__interrupt__"][0].value
-    #   - call prompt_human(payload)
-    #   - resume with app.invoke(Command(resume=<answer>), cfg)
-    # while "__interrupt__" in result:
-    #     ...
+    while "__interrupt__" in result:
+        payload = result["__interrupt__"][0].value
+        answer = prompt_human(payload)
+        result = app.invoke(Command(resume=answer), cfg)
 
     console.rule("Done")
     console.print(result.get("final_action"))

@@ -1,5 +1,4 @@
-"""Shared types: the graph state, the LLM's structured analysis output,
-and the structured audit-trail entry written to PostgreSQL."""
+"""Shared graph state, structured LLM output, and SQLite audit entry types."""
 
 from __future__ import annotations
 
@@ -60,7 +59,7 @@ class PRAnalysis(BaseModel):
 
 
 class AuditEntry(BaseModel):
-    """One row of the PostgreSQL audit trail.
+    """One structured row of the SQLite audit trail.
 
     Designed as a structured *decision log* — one entry per meaningful event
     in a review session (LLM analysis, HITL interrupt, reviewer response,
@@ -133,7 +132,10 @@ class ReviewState(TypedDict, total=False):
     human_choice: HumanChoice | None
     human_feedback: str | None
     escalation_answers: dict[str, str] | None
+    confirm_escalated_review: bool
+    escalation_confirmation: HumanChoice | None
 
     # Populated by commit / final nodes
     posted_comment_body: str | None
+    posted_comment_url: str | None
     final_action: str | None
